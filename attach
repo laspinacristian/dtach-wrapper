@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# attach - a tiny wrapper around dtach
+#
+#   attach <name>        attach to session <name> (created if it does not exist)
+#   attach ls            list active sessions
+#   attach kill <name>   terminate session <name>
+#
+# Sessions live in /tmp/dtach/<name>.
+# Detach key: ^\ (override with ATTACH_DETACH_KEY, e.g. '^]').
+
+set -euo pipefail
+
+DIR=/tmp/dtach
+DETACH_KEY="${ATTACH_DETACH_KEY:-^\\}"
+SHELL_CMD="${SHELL:-/bin/bash}"
+
+usage() {
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+die() { echo "attach: $*" >&2; exit 1; }
+
+# Prevent nesting: the variable is exported when the session is created,
+# so everything running inside it inherits it.
+check_nested() {
+    if [[ -n "${DTACH_SESSION:-}" ]]; then
+        echo "you're already inside ${DTACH_SESSION}" >&2
+        exit 1
+    fi
+}
+
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid session name: '$1'"
+}
+
+is_alive() {
+    [[ -S "$DIR/$1" ]] && fuser -s "$DIR/$1" 2>/dev/null
+}
+
+cmd_ls() {
+    mkdir -p "$DIR"
+    local found=0 s name
+    for s in "$DIR"/*; do
+        [[ -S "$s" ]] || continue
+        name=$(basename "$s")
+        if is_alive "$name"; then
+            echo "$name"
+            found=1
+        else
+            rm -f "$s"   # orphaned socket
+        fi
+    done
+    (( found )) || echo "no active sessions"
+}
+
+cmd_kill() {
+    local name="$1" sock pids
+    valid_name "$name"
+    sock="$DIR/$name"
+    [[ -S "$sock" ]] || die "session '$name' does not exist"
+    pids=$(fuser "$sock" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        # shellcheck disable=SC2086
+        kill -TERM $pids 2>/dev/null || true
+        sleep 0.2
+        # shellcheck disable=SC2086
+        kill -KILL $pids 2>/dev/null || true
+    fi
+    rm -f "$sock"
+    echo "session '$name' terminated"
+}
+
+cmd_attach() {
+    local name="$1"
+    valid_name "$name"
+    mkdir -p "$DIR"
+    chmod 700 "$DIR"
+    # orphaned socket -> remove it so dtach creates a fresh one
+    if [[ -S "$DIR/$name" ]] && ! is_alive "$name"; then
+        rm -f "$DIR/$name"
+    fi
+    DTACH_SESSION="$name" exec dtach -A "$DIR/$name" -e "$DETACH_KEY" -z "$SHELL_CMD"
+}
+
+[[ $# -ge 1 ]] || usage
+
+case "$1" in
+    ls|list)
+        [[ $# -eq 1 ]] || usage
+        cmd_ls ;;
+    kill)
+        [[ $# -eq 2 ]] || usage
+        check_nested
+        cmd_kill "$2" ;;
+    -h|--help|help)
+        usage ;;
+    *)
+        [[ $# -eq 1 ]] || usage
+        check_nested
+        cmd_attach "$1" ;;
+esac
